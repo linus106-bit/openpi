@@ -40,7 +40,9 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+import openpi.models.acot_config
 import openpi.models.pi0_config
+import openpi.models_pytorch.acot_vla_pytorch
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -364,7 +366,7 @@ def train_loop(config: _config.TrainConfig):
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        observation, actions = sample_batch[:2]
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -390,7 +392,10 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    if isinstance(config.model, openpi.models.acot_config.ACOTConfig):
+        model_cfg = dataclasses.replace(config.model, dtype=config.pytorch_training_precision)
+        model = openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch(model_cfg).to(device)
+    elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -401,12 +406,12 @@ def train_loop(config: _config.TrainConfig):
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
         )
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
     else:
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -511,22 +516,30 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for batch in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
+            observation, actions = batch[:2]
+            coarse_actions = batch[2] if len(batch) == 3 else None
+
+            # The unified data loader returns (observation, actions), or
+            # (observation, actions, coarse_actions) for ACOT.
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
+            if coarse_actions is not None:
+                coarse_actions = coarse_actions.to(torch.float32).to(device)
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
+            losses = (
+                model(observation, actions, coarse_actions) if coarse_actions is not None else model(observation, actions)
+            )
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)

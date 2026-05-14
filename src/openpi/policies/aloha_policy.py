@@ -96,9 +96,12 @@ class AlohaOutputs(transforms.DataTransformFn):
     adapt_to_pi: bool = True
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :14])
-        return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        result = {}
+        for key in ("actions", "coarse_actions"):
+            if key in data:
+                actions = np.asarray(data[key][:, :14])
+                result[key] = _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)
+        return result
 
 
 def _joint_flip_mask() -> np.ndarray:

@@ -100,6 +100,11 @@ class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
         self._observation_spec, self._action_spec = model_config.inputs_spec()
+        self._coarse_action_spec = (
+            model_config.coarse_actions_spec()
+            if model_config.model_type in (_model.ModelType.ACOT_VLA_PI0, _model.ModelType.ACOT_VLA_PI05)
+            else None
+        )
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         rng = jax.random.key(index.__index__())
@@ -117,11 +122,17 @@ class FakeDataset(Dataset):
 
         observation = jax.tree.map(make_from_spec, self._observation_spec)
         action = jax.tree.map(make_from_spec, self._action_spec)
+        coarse_action = (
+            jax.tree.map(make_from_spec, self._coarse_action_spec) if self._coarse_action_spec is not None else None
+        )
 
-        return {
+        result = {
             **observation.to_dict(),
             "actions": action,
         }
+        if coarse_action is not None:
+            result["coarse_actions"] = coarse_action
+        return result
 
     def __len__(self) -> int:
         return self._num_samples
@@ -138,6 +149,12 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    if model_config.model_type in (_model.ModelType.ACOT_VLA_PI0, _model.ModelType.ACOT_VLA_PI05):
+        action_horizon = max(
+            (model_config.coarse_action_horizon - 1) * model_config.coarse_action_stride + 1,
+            (model_config.action_horizon - 1) * model_config.action_stride + 1,
+        )
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
@@ -537,4 +554,7 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            if "coarse_actions" in batch:
+                yield _model.Observation.from_dict(batch), batch["actions"], batch["coarse_actions"]
+            else:
+                yield _model.Observation.from_dict(batch), batch["actions"]

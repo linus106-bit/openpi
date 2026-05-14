@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.acot_config as acot_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -134,6 +135,43 @@ class ModelTransformFactory(GroupFactory):
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.ACOT_VLA_PI0:
+                assert isinstance(model_config, acot_config.ACOTConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        ),
+                        _transforms.GenerateACOTActions(
+                            model_config.coarse_action_horizon,
+                            model_config.action_horizon,
+                            model_config.coarse_action_stride,
+                            model_config.action_stride,
+                        ),
+                        _transforms.ACOTPadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.ACOT_VLA_PI05:
+                assert isinstance(model_config, acot_config.ACOTConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.GenerateACOTActions(
+                            model_config.coarse_action_horizon,
+                            model_config.action_horizon,
+                            model_config.coarse_action_stride,
+                            model_config.action_stride,
+                        ),
+                        _transforms.ACOTPadStatesAndActions(model_config.action_dim),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -964,6 +1002,46 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_acot",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=acot_config.ACOTConfig(
+            paligemma_variant="dummy",
+            coarse_action_expert_variant="dummy",
+            action_expert_variant="dummy",
+            coarse_action_horizon=6,
+            action_horizon=4,
+            pi05=True,
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            pytorch_compile_mode=None,
+        ),
+        save_interval=100,
+        overwrite=True,
+        exp_name="debug_acot",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="acot_icra_simulation_challenge_reasoning_to_action_torch",
+        model=acot_config.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            pi05=True,
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=20_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

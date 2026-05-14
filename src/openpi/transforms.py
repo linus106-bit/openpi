@@ -127,9 +127,10 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
+        norm_stats = _with_acot_coarse_action_stats(data, self.norm_stats)
         return apply_tree(
             data,
-            self.norm_stats,
+            norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
@@ -159,10 +160,11 @@ class Unnormalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
+        norm_stats = _with_acot_coarse_action_stats(data, self.norm_stats)
         # Make sure that all the keys in the norm stats are present in the data.
         return apply_tree(
             data,
-            self.norm_stats,
+            norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
             strict=True,
         )
@@ -219,6 +221,74 @@ class DeltaActions(DataTransformFn):
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class GenerateACOTActions(DataTransformFn):
+    coarse_action_horizon: int
+    action_horizon: int
+    coarse_action_stride: int = 2
+    action_stride: int = 1
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" not in data:
+            return data
+        if "coarse_actions" in data:
+            return data
+
+        raw_actions = data["actions"]
+        specs = {
+            "coarse_actions": (self.coarse_action_horizon, self.coarse_action_stride),
+            "actions": (self.action_horizon, self.action_stride),
+        }
+        for key, (horizon, stride) in specs.items():
+            required_length = (horizon - 1) * stride + 1
+            if raw_actions.shape[0] < required_length:
+                raise ValueError(
+                    f"Need at least {required_length} raw actions to build {key}, got {raw_actions.shape[0]}."
+                )
+            data[key] = raw_actions[:required_length:stride]
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ACOTDeltaActions(DataTransformFn):
+    mask: Sequence[bool] | None
+    use_delta_joint_actions: Sequence[bool]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.mask is None:
+            return data
+
+        state = data["state"]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        for use_delta, key in zip(self.use_delta_joint_actions, ("coarse_actions", "actions"), strict=True):
+            if use_delta and key in data:
+                actions = data[key]
+                actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+                data[key] = actions
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ACOTAbsoluteActions(DataTransformFn):
+    mask: Sequence[bool] | None
+    use_delta_joint_actions: Sequence[bool]
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.mask is None:
+            return data
+
+        state = data["state"]
+        mask = np.asarray(self.mask)
+        dims = mask.shape[-1]
+        for use_delta, key in zip(self.use_delta_joint_actions, ("coarse_actions", "actions"), strict=True):
+            if use_delta and key in data:
+                actions = data[key]
+                actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+                data[key] = actions
         return data
 
 
@@ -337,6 +407,20 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
+@dataclasses.dataclass(frozen=True)
+class ACOTPadStatesAndActions(DataTransformFn):
+    """Zero-pads states, final actions, and coarse actions to the model action dimension."""
+
+    model_action_dim: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        for key in ("coarse_actions", "actions"):
+            if key in data:
+                data[key] = pad_to_dim(data[key], self.model_action_dim, axis=-1)
+        return data
+
+
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")
@@ -418,6 +502,16 @@ def apply_tree(
                 raise ValueError(f"Selector key {k} not found in tree")
 
     return unflatten_dict({k: transform(k, v) for k, v in tree.items()})
+
+
+def _with_acot_coarse_action_stats(data: DataDict, norm_stats: at.PyTree[NormStats]) -> at.PyTree[NormStats]:
+    flat_data = flatten_dict(data)
+    flat_stats = flatten_dict(norm_stats)
+    if "coarse_actions" in flat_data and "coarse_actions" not in flat_stats and "actions" in flat_stats:
+        flat_stats = dict(flat_stats)
+        flat_stats["coarse_actions"] = flat_stats["actions"]
+        return unflatten_dict(flat_stats)
+    return norm_stats
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:

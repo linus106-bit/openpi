@@ -2,6 +2,7 @@ import dataclasses
 
 import jax
 
+from openpi.models import acot_config
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
@@ -60,6 +61,31 @@ def test_with_fake_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_acot_fake_dataset_returns_coarse_actions():
+    config = _config.get_config("debug_acot")
+    loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=2, framework="pytorch")
+    batches = list(loader)
+
+    assert len(batches) == 2
+    for _, actions, coarse_actions in batches:
+        assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+        assert coarse_actions.shape == (
+            config.batch_size,
+            config.model.coarse_action_horizon,
+            config.model.action_dim,
+        )
+
+
+def test_acot_config_specs():
+    config = acot_config.ACOTConfig(action_dim=7, action_horizon=10, coarse_action_horizon=15)
+    _, actions = config.inputs_spec(batch_size=3)
+    coarse_actions = config.coarse_actions_spec(batch_size=3)
+
+    assert config.model_type.value == "acot_pi05"
+    assert actions.shape == (3, 10, 7)
+    assert coarse_actions.shape == (3, 15, 7)
 
 
 def test_with_real_dataset():
