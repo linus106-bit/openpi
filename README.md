@@ -267,7 +267,7 @@ To finetune a model in PyTorch:
 
 3. Launch training using one of these modes:
 
-For ACoT-VLA on LIBERO, convert the `pi05_base` checkpoint and use it to initialize both ACOT action experts:
+For ACoT-VLA on LIBERO, convert the `pi05_base` checkpoint and use the original ACoT-VLA initialization mapping for the coarse reasoner:
 
 ```bash
 uv run examples/convert_jax_model_to_pytorch.py \

@@ -156,21 +156,20 @@ def unwrap_model(model):
 def _expand_pi0_weights_for_acot(state_dict):
     """Map a converted PI0/PI05 PyTorch checkpoint onto the ACOT PyTorch model.
 
-    A PI0 checkpoint has one action expert. ACOT has two action experts: the coarse
-    reasoner expert and the final action expert. Use the PI0 action expert to
-    initialize both streams, and copy PI0 action/time projections into the coarse
-    projection names where shapes match.
+    This mirrors ACoT-VLA's JAX ACOTCheckpointWeightLoader: keep all matching
+    PI0/PI05 weights, use the PI0 action expert for ACOT's coarse reasoner
+    expert, and copy action/time projections into their coarse projection names.
+    The final ACOT action expert is left at model initialization unless an ACOT
+    checkpoint already provides it.
     """
     expanded = dict(state_dict)
     for key, value in list(state_dict.items()):
         if key.startswith("paligemma_with_expert.gemma_expert."):
             suffix = key.removeprefix("paligemma_with_expert.gemma_expert.")
             expanded[f"paligemma_with_expert.gemma_experts.0.{suffix}"] = value
-            expanded[f"paligemma_with_expert.gemma_experts.1.{suffix}"] = value
         elif key.startswith("paligemma_with_expert.gemma_experts.0."):
             suffix = key.removeprefix("paligemma_with_expert.gemma_experts.0.")
             expanded[f"paligemma_with_expert.gemma_expert.{suffix}"] = value
-            expanded[f"paligemma_with_expert.gemma_experts.1.{suffix}"] = value
 
         projection_copies = {
             "action_in_proj.": "coarse_action_in_proj.",
@@ -191,8 +190,8 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
     """Load an initial PyTorch checkpoint for fine-tuning.
 
     ACOT can be initialized from either an ACOT checkpoint or a converted PI0/PI05
-    checkpoint. The latter is expanded so the single PI0 action expert initializes
-    both ACOT action streams.
+    checkpoint. The latter is expanded with the same mapping used by the original
+    JAX ACoT-VLA loader.
     """
     model_to_load = unwrap_model(model)
     model_path = os.path.join(pytorch_weight_path, "model.safetensors")
