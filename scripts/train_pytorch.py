@@ -148,6 +148,80 @@ def get_model_parameters(model):
     )
 
 
+def unwrap_model(model):
+    """Return the underlying model when DDP is enabled."""
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def _expand_pi0_weights_for_acot(state_dict):
+    """Map a converted PI0/PI05 PyTorch checkpoint onto the ACOT PyTorch model.
+
+    A PI0 checkpoint has one action expert. ACOT has two action experts: the coarse
+    reasoner expert and the final action expert. Use the PI0 action expert to
+    initialize both streams, and copy PI0 action/time projections into the coarse
+    projection names where shapes match.
+    """
+    expanded = dict(state_dict)
+    for key, value in list(state_dict.items()):
+        if key.startswith("paligemma_with_expert.gemma_expert."):
+            suffix = key.removeprefix("paligemma_with_expert.gemma_expert.")
+            expanded[f"paligemma_with_expert.gemma_experts.0.{suffix}"] = value
+            expanded[f"paligemma_with_expert.gemma_experts.1.{suffix}"] = value
+        elif key.startswith("paligemma_with_expert.gemma_experts.0."):
+            suffix = key.removeprefix("paligemma_with_expert.gemma_experts.0.")
+            expanded[f"paligemma_with_expert.gemma_expert.{suffix}"] = value
+            expanded[f"paligemma_with_expert.gemma_experts.1.{suffix}"] = value
+
+        projection_copies = {
+            "action_in_proj.": "coarse_action_in_proj.",
+            "action_out_proj.": "coarse_action_out_proj.",
+            "time_mlp_in.": "coarse_time_mlp_in.",
+            "time_mlp_out.": "coarse_time_mlp_out.",
+            "action_time_mlp_in.": "coarse_action_time_mlp_in.",
+            "action_time_mlp_out.": "coarse_action_time_mlp_out.",
+        }
+        for src_prefix, dst_prefix in projection_copies.items():
+            if key.startswith(src_prefix):
+                expanded[f"{dst_prefix}{key.removeprefix(src_prefix)}"] = value
+                break
+    return expanded
+
+
+def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
+    """Load an initial PyTorch checkpoint for fine-tuning.
+
+    ACOT can be initialized from either an ACOT checkpoint or a converted PI0/PI05
+    checkpoint. The latter is expanded so the single PI0 action expert initializes
+    both ACOT action streams.
+    """
+    model_to_load = unwrap_model(model)
+    model_path = os.path.join(pytorch_weight_path, "model.safetensors")
+    if isinstance(model_to_load, openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch):
+        state_dict = safetensors.torch.load_file(model_path, device=str(device))
+        is_acot_checkpoint = any(
+            key.startswith("coarse_action_in_proj.") or "paligemma_with_expert.gemma_experts.1." in key
+            for key in state_dict
+        )
+        if not is_acot_checkpoint:
+            logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
+            state_dict = _expand_pi0_weights_for_acot(state_dict)
+        missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+        logging.info(
+            "Loaded PyTorch weights from %s with %d missing and %d unexpected keys",
+            pytorch_weight_path,
+            len(missing),
+            len(unexpected),
+        )
+        if missing:
+            logging.info("Missing keys after ACOT initialization: %s", list(missing)[:20])
+        if unexpected:
+            logging.info("Unexpected keys after ACOT initialization: %s", list(unexpected)[:20])
+        return
+
+    safetensors.torch.load_model(model_to_load, model_path)
+    logging.info(f"Loaded PyTorch weights from {pytorch_weight_path}")
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -446,12 +520,7 @@ def train_loop(config: _config.TrainConfig):
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        load_initial_pytorch_weights(model, config.pytorch_weight_path, device)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps

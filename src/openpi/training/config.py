@@ -799,6 +799,40 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="acot_libero_action_cot_explicit_implicit_co_fusion_torch",
+        model=acot_config.ACOTConfig(
+            coarse_action_horizon=15,
+            action_horizon=10,
+            pi05=True,
+            discrete_state_input=False,
+            coarse_action_expert_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            coarse_action_stride=2,
+            action_stride=1,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        pytorch_weight_path="/path/to/converted/pi05_base_pytorch",
+        num_train_steps=51_000,
+        save_interval=10_000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
