@@ -24,7 +24,6 @@ Multi-Node Training:
 """
 
 import dataclasses
-import contextlib
 import gc
 import logging
 import os
@@ -585,34 +584,31 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            sync_gradients = (micro_step + 1) % config.gradient_accumulation_steps == 0
-            sync_context = model.no_sync() if use_ddp and not sync_gradients else contextlib.nullcontext()
-            with sync_context:
-                # Forward pass
-                losses = (
-                    model(observation, actions, coarse_actions)
-                    if coarse_actions is not None
-                    else model(observation, actions)
-                )
-                # Ensure losses is a tensor and handle different return types
-                if isinstance(losses, list | tuple):
-                    losses = torch.stack(losses)
-                elif not isinstance(losses, torch.Tensor):
-                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            should_step = (micro_step + 1) % config.gradient_accumulation_steps == 0
+            # Keep DDP gradient hooks active for every micro-batch. This costs more communication
+            # than no_sync(), but avoids reducer state issues with activation checkpointing.
+            losses = (
+                model(observation, actions, coarse_actions) if coarse_actions is not None else model(observation, actions)
+            )
+            # Ensure losses is a tensor and handle different return types
+            if isinstance(losses, list | tuple):
+                losses = torch.stack(losses)
+            elif not isinstance(losses, torch.Tensor):
+                losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-                raw_loss = losses.mean()
-                loss = raw_loss / config.gradient_accumulation_steps
-                accumulated_loss += raw_loss.detach().item()
+            raw_loss = losses.mean()
+            loss = raw_loss / config.gradient_accumulation_steps
+            accumulated_loss += raw_loss.detach().item()
 
-                # Backward pass
-                loss.backward()
+            # Backward pass
+            loss.backward()
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
             micro_step += 1
-            if not sync_gradients:
+            if not should_step:
                 continue
 
             # Gradient clipping
