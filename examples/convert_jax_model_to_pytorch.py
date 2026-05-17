@@ -445,7 +445,6 @@ def _add_paligemma_tied_embedding_aliases(state_dict):
     expanded = dict(state_dict)
     tied_keys = [
         "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
-        "paligemma_with_expert.paligemma.language_model.embed_tokens.weight",
         "paligemma_with_expert.paligemma.lm_head.weight",
     ]
     tied_value = next((expanded[key] for key in tied_keys if key in expanded), None)
