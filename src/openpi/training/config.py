@@ -540,8 +540,12 @@ class TrainConfig:
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
-    # Global batch size.
+    # Global batch size for each forward/backward pass.
     batch_size: int = 32
+    # Number of micro-batches to accumulate before each optimizer step.
+    # The effective global batch size for PyTorch training is
+    # batch_size * gradient_accumulation_steps.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -592,6 +596,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1.")
 
 
 # Use `get_config` if you need to get a config by name in your code.

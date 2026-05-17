@@ -283,6 +283,16 @@ uv run scripts/train_pytorch.py acot_libero_action_cot_explicit_implicit_co_fusi
     --pytorch_weight_path /path/to/converted/acot_libero_pytorch
 ```
 
+If ACoT-VLA runs out of GPU memory, reduce the micro-batch and accumulate gradients:
+
+```bash
+uv run scripts/train_pytorch.py acot_libero_action_cot_explicit_implicit_co_fusion_torch \
+    --exp_name acot_libero \
+    --pytorch_weight_path /path/to/converted/acot_libero_pytorch \
+    --batch-size 8 \
+    --gradient-accumulation-steps 16
+```
+
 ```bash
 # Single GPU training:
 uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>

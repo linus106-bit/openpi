@@ -24,6 +24,7 @@ Multi-Node Training:
 """
 
 import dataclasses
+import contextlib
 import gc
 import logging
 import os
@@ -349,6 +350,7 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -392,9 +394,16 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
+    if config.batch_size % world_size != 0:
+        raise ValueError(
+            f"Batch size {config.batch_size} must be divisible by the number of PyTorch workers {world_size}."
+        )
     effective_batch_size = config.batch_size // world_size
+    effective_global_batch_size = config.batch_size * config.gradient_accumulation_steps
     logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        f"Using micro-batch size per GPU: {effective_batch_size} "
+        f"(global micro-batch: {config.batch_size}, accumulation: {config.gradient_accumulation_steps}, "
+        f"effective global batch: {effective_global_batch_size})"
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
@@ -501,6 +510,7 @@ def train_loop(config: _config.TrainConfig):
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        foreach=False,
     )
 
     # Load checkpoint if resuming
@@ -527,7 +537,9 @@ def train_loop(config: _config.TrainConfig):
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
         )
         logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
+            f"Training config: batch_size={config.batch_size}, "
+            f"gradient_accumulation_steps={config.gradient_accumulation_steps}, "
+            f"effective_global_batch_size={effective_global_batch_size}, num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
@@ -546,6 +558,8 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    micro_step = 0
+    accumulated_loss = 0.0
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
@@ -571,24 +585,35 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = (
-                model(observation, actions, coarse_actions) if coarse_actions is not None else model(observation, actions)
-            )
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            sync_gradients = (micro_step + 1) % config.gradient_accumulation_steps == 0
+            sync_context = model.no_sync() if use_ddp and not sync_gradients else contextlib.nullcontext()
+            with sync_context:
+                # Forward pass
+                losses = (
+                    model(observation, actions, coarse_actions)
+                    if coarse_actions is not None
+                    else model(observation, actions)
+                )
+                # Ensure losses is a tensor and handle different return types
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+                raw_loss = losses.mean()
+                loss = raw_loss / config.gradient_accumulation_steps
+                accumulated_loss += raw_loss.detach().item()
 
-            # Backward pass
-            loss.backward()
+                # Backward pass
+                loss.backward()
 
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
+
+            micro_step += 1
+            if not sync_gradients:
+                continue
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
@@ -607,7 +632,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": accumulated_loss / config.gradient_accumulation_steps,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -656,8 +681,13 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "loss": f"{accumulated_loss / config.gradient_accumulation_steps:.4f}",
+                        "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                        "step": global_step,
+                    }
                 )
+            accumulated_loss = 0.0
 
     # Close progress bar
     if pbar is not None:

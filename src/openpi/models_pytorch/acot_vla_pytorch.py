@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 from typing import Literal
@@ -414,14 +415,29 @@ class ACOTPytorch(PI0Pytorch):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None, None],
-            use_cache=True,
-        )
+        language_model = self.paligemma_with_expert.paligemma.language_model
+        language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        prev_gradient_checkpointing = getattr(language_model, "gradient_checkpointing", False)
+        cache_without_grad = self.training and prev_gradient_checkpointing
+        cache_context = torch.no_grad() if cache_without_grad else contextlib.nullcontext()
+        if prev_gradient_checkpointing:
+            language_model.gradient_checkpointing = False
+        try:
+            with cache_context:
+                _, past_key_values = self.paligemma_with_expert.forward(
+                    attention_mask=prefix_att_2d_masks_4d,
+                    position_ids=prefix_position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, None, None],
+                    use_cache=True,
+                )
+        finally:
+            if prev_gradient_checkpointing:
+                language_model.gradient_checkpointing = prev_gradient_checkpointing
+
+        if past_key_values is None:
+            raise RuntimeError("Prefix KV cache was not produced; implicit ACoT reasoning requires use_cache=True.")
         if not self.adopt_implicit_action_reasoner:
             return past_key_values, None
         keys, values = self._kv_cache_to_layer_tokens(past_key_values)
