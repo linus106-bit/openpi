@@ -187,7 +187,7 @@ def _expand_pi0_weights_for_acot(state_dict):
 
 
 def _add_paligemma_language_model_aliases(state_dict):
-    """Materialize PaliGemma language-model aliases omitted by safetensors save_model."""
+    """Materialize PaliGemma aliases omitted by safetensors save_model."""
     expanded = dict(state_dict)
     model_prefix = "paligemma_with_expert.paligemma.model.language_model."
     direct_prefix = "paligemma_with_expert.paligemma.language_model."
@@ -198,6 +198,18 @@ def _add_paligemma_language_model_aliases(state_dict):
         elif key.startswith(direct_prefix):
             alias = f"{model_prefix}{key.removeprefix(direct_prefix)}"
             expanded.setdefault(alias, value)
+
+    # PaliGemma ties input embeddings and lm_head. save_model keeps only one
+    # shared tensor, while raw load_state_dict expects both state_dict keys.
+    tied_keys = [
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+        "paligemma_with_expert.paligemma.language_model.embed_tokens.weight",
+        "paligemma_with_expert.paligemma.lm_head.weight",
+    ]
+    tied_value = next((expanded[key] for key in tied_keys if key in expanded), None)
+    if tied_value is not None:
+        for key in tied_keys:
+            expanded.setdefault(key, tied_value)
     return expanded
 
 
