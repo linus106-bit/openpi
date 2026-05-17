@@ -442,19 +442,26 @@ class ACOTPytorch(PI0Pytorch):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks_4d = self._prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks))
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        inputs = [prefix_embs, None, None]
-        inputs[stream_idx] = suffix_embs
-        adarms = [None, None, None]
-        adarms[stream_idx] = adarms_cond
-        outputs, _ = self.paligemma_with_expert.forward(
-            attention_mask=att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=inputs,
-            use_cache=False,
-            adarms_cond=adarms,
-        )
-        return outputs[stream_idx]
+
+        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, *adarms_args):
+            inputs = [prefix_embs, None, None]
+            inputs[stream_idx] = suffix_embs
+            adarms = [None, None, None]
+            adarms[stream_idx] = adarms_args[0] if adarms_args else None
+            outputs, _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=inputs,
+                use_cache=False,
+                adarms_cond=adarms,
+            )
+            return outputs[stream_idx]
+
+        checkpoint_args = (prefix_embs, suffix_embs, att_2d_masks_4d, position_ids)
+        if adarms_cond is not None:
+            checkpoint_args = (*checkpoint_args, adarms_cond)
+        return self._apply_checkpoint(forward_func, *checkpoint_args)
 
     def forward(self, observation, actions, coarse_actions=None, noise=None, coarse_noise=None, time=None) -> Tensor:
         if coarse_actions is None:
