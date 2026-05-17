@@ -829,7 +829,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         weight_loader=weight_loaders.NoOpWeightLoader(),
-        pytorch_weight_path="/path/to/converted/pi05_base_pytorch",
+        pytorch_weight_path="/path/to/converted/acot_libero_pytorch",
         num_train_steps=51_000,
         save_interval=10_000,
     ),

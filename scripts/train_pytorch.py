@@ -239,14 +239,28 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
     model_to_load = unwrap_model(model)
     model_path = os.path.join(pytorch_weight_path, "model.safetensors")
     if isinstance(model_to_load, openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch):
-        state_dict = safetensors.torch.load_file(model_path, device=str(device))
+        with safetensors.safe_open(model_path, framework="pt", device=str(device)) as checkpoint_file:
+            checkpoint_keys = list(checkpoint_file.keys())
         is_acot_checkpoint = any(
             key.startswith("coarse_action_in_proj.") or "paligemma_with_expert.gemma_experts.1." in key
-            for key in state_dict
+            for key in checkpoint_keys
         )
-        if not is_acot_checkpoint:
-            logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
-            state_dict = _expand_pi0_weights_for_acot(state_dict)
+        if is_acot_checkpoint:
+            missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, device=str(device))
+            logging.info(
+                "Loaded ACOT PyTorch weights from %s with %d missing and %d unexpected keys",
+                pytorch_weight_path,
+                len(missing),
+                len(unexpected),
+            )
+            if missing:
+                logging.warning("Missing keys after ACOT load_model: %s", list(missing)[:20])
+            if unexpected:
+                logging.warning("Unexpected keys after ACOT load_model: %s", list(unexpected)[:20])
+            return
+        logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
+        state_dict = safetensors.torch.load_file(model_path, device=str(device))
+        state_dict = _expand_pi0_weights_for_acot(state_dict)
         state_dict = _add_paligemma_language_model_aliases(state_dict)
         missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
         expected_missing = [key for key in missing if _is_expected_missing_acot_key(key)]

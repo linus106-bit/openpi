@@ -267,20 +267,21 @@ To finetune a model in PyTorch:
 
 3. Launch training using one of these modes:
 
-For ACoT-VLA on LIBERO, convert the `pi05_base` checkpoint and use the original ACoT-VLA initialization mapping for the coarse reasoner:
+For ACoT-VLA on LIBERO, convert the `pi05_base` checkpoint into an ACOT-shaped PyTorch checkpoint. The converter applies the original ACoT-VLA initialization mapping for the coarse reasoner and saves a checkpoint that can be loaded with `safetensors.torch.load_model(...)`.
 
 ```bash
 uv run examples/convert_jax_model_to_pytorch.py \
     --config_name pi05_aloha \
+    --target_config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
     --checkpoint_dir /path/to/pi05_base \
-    --output_path /path/to/converted/pi05_base_pytorch
+    --output_path /path/to/converted/acot_libero_pytorch
 
 uv run scripts/compute_norm_stats.py \
     --config-name acot_libero_action_cot_explicit_implicit_co_fusion_torch
 
 uv run scripts/train_pytorch.py acot_libero_action_cot_explicit_implicit_co_fusion_torch \
     --exp_name acot_libero \
-    --pytorch_weight_path /path/to/converted/pi05_base_pytorch
+    --pytorch_weight_path /path/to/converted/acot_libero_pytorch
 ```
 
 ```bash

@@ -24,8 +24,16 @@ Example:
 
     # pi05_droid
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid --output_path /home/$USER/.cache/openpi/openpi-assets/checkpoints/pi05_droid_pytorch
+
+    # pi05_base converted into an ACOT-shaped PyTorch checkpoint
+    python examples/convert_jax_model_to_pytorch.py \
+        --config_name pi05_aloha \
+        --target_config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
+        --checkpoint_dir /path/to/pi05_base \
+        --output_path /path/to/converted/acot_libero_pytorch
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -39,9 +47,11 @@ import safetensors
 import torch
 import tyro
 
+import openpi.models.acot_config
 import openpi.models.gemma
 import openpi.models.model
 import openpi.models.pi0_config
+import openpi.models_pytorch.acot_vla_pytorch
 import openpi.models_pytorch.pi0_pytorch
 from openpi.training import utils
 import openpi.training.config as _config
@@ -405,6 +415,63 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
     return {"paligemma_params": traversals.flatten_mapping(params["PaliGemma"], sep="/"), "projection_params": params}
 
 
+def _expand_pi0_weights_for_acot(state_dict):
+    """Map converted PI0/PI05 PyTorch weights onto the ACOT PyTorch model."""
+    expanded = dict(state_dict)
+    for key, value in list(state_dict.items()):
+        if key.startswith("paligemma_with_expert.gemma_expert."):
+            suffix = key.removeprefix("paligemma_with_expert.gemma_expert.")
+            expanded[f"paligemma_with_expert.gemma_experts.0.{suffix}"] = value
+        elif key.startswith("paligemma_with_expert.gemma_experts.0."):
+            suffix = key.removeprefix("paligemma_with_expert.gemma_experts.0.")
+            expanded[f"paligemma_with_expert.gemma_expert.{suffix}"] = value
+
+        projection_copies = {
+            "action_in_proj.": "coarse_action_in_proj.",
+            "action_out_proj.": "coarse_action_out_proj.",
+            "time_mlp_in.": "coarse_time_mlp_in.",
+            "time_mlp_out.": "coarse_time_mlp_out.",
+            "action_time_mlp_in.": "coarse_action_time_mlp_in.",
+            "action_time_mlp_out.": "coarse_action_time_mlp_out.",
+        }
+        for src_prefix, dst_prefix in projection_copies.items():
+            if key.startswith(src_prefix):
+                expanded[f"{dst_prefix}{key.removeprefix(src_prefix)}"] = value
+                break
+    return expanded
+
+
+def _add_paligemma_tied_embedding_aliases(state_dict):
+    """Materialize PaliGemma tied embedding aliases before raw load_state_dict."""
+    expanded = dict(state_dict)
+    tied_keys = [
+        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+        "paligemma_with_expert.paligemma.language_model.embed_tokens.weight",
+        "paligemma_with_expert.paligemma.lm_head.weight",
+    ]
+    tied_value = next((expanded[key] for key in tied_keys if key in expanded), None)
+    if tied_value is not None:
+        for key in tied_keys:
+            expanded.setdefault(key, tied_value)
+    return expanded
+
+
+def _is_expected_missing_acot_key(key: str) -> bool:
+    """Keys initialized by the target ACOT model when bootstrapping from PI0/PI05."""
+    if key.startswith("paligemma_with_expert.gemma_experts.1."):
+        return True
+    return key.startswith(
+        (
+            "explicit_action_reasoner.",
+            "implicit_action_reasoner.",
+            "implicit_action_reasoner_interact.",
+            "explicit_action_reason_proj.",
+            "implicit_action_reason_proj.",
+            "action_reasoning_fusion.",
+        )
+    )
+
+
 def load_jax_model_and_print_keys(checkpoint_dir: str):
     """
     Load JAX model from checkpoint and print all parameter keys.
@@ -420,7 +487,11 @@ def load_jax_model_and_print_keys(checkpoint_dir: str):
 
 
 def convert_pi0_checkpoint(
-    checkpoint_dir: str, precision: str, output_path: str, model_config: openpi.models.pi0_config.Pi0Config
+    checkpoint_dir: str,
+    precision: str,
+    output_path: str,
+    model_config: openpi.models.pi0_config.Pi0Config,
+    target_model_config: openpi.models.model.BaseModelConfig | None = None,
 ):
     """
     Convert PI0 JAX checkpoint to PyTorch format.
@@ -510,19 +581,36 @@ def convert_pi0_checkpoint(
         expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
     )
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
-
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    target_model_config = target_model_config or model_config
+    if isinstance(target_model_config, openpi.models.pi0_config.Pi0Config):
+        pytorch_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(target_model_config)
+        missing, unexpected = pytorch_model.load_state_dict(
+            _add_paligemma_tied_embedding_aliases(all_params), strict=False
+        )
+        if missing:
+            print(f"Warning: missing PI0 keys during conversion: {missing[:20]}")
+        if unexpected:
+            print(f"Warning: unexpected PI0 keys during conversion: {unexpected[:20]}")
+    elif isinstance(target_model_config, openpi.models.acot_config.ACOTConfig):
+        target_model_config = dataclasses.replace(target_model_config, pytorch_compile_mode=None)
+        pytorch_model = openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch(target_model_config)
+        acot_params = _add_paligemma_tied_embedding_aliases(_expand_pi0_weights_for_acot(all_params))
+        missing, unexpected = pytorch_model.load_state_dict(acot_params, strict=False)
+        unexpected_missing = [key for key in missing if not _is_expected_missing_acot_key(key)]
+        if unexpected_missing:
+            print(f"Warning: unexpected missing ACOT keys during conversion: {unexpected_missing[:20]}")
+        if unexpected:
+            print(f"Warning: unexpected ACOT keys during conversion: {unexpected[:20]}")
+    else:
+        raise ValueError(f"Unsupported target model config type: {type(target_model_config)}")
 
     if precision == "float32":
-        pi0_model = pi0_model.to(torch.float32)
+        pytorch_model = pytorch_model.to(torch.float32)
     elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
+        pytorch_model = pytorch_model.to(torch.bfloat16)
     else:
         raise ValueError(f"Invalid precision: {precision}")
 
@@ -530,7 +618,7 @@ def convert_pi0_checkpoint(
     os.makedirs(output_path, exist_ok=True)
 
     # Save model weights as SafeTensors using save_model to handle tied weights
-    safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))
+    safetensors.torch.save_model(pytorch_model, os.path.join(output_path, "model.safetensors"))
 
     # Copy assets folder if it exists
     assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
@@ -542,11 +630,14 @@ def convert_pi0_checkpoint(
 
     # Save config as JSON for reference
     config_dict = {
-        "action_dim": model_config.action_dim,
-        "action_horizon": model_config.action_horizon,
-        "paligemma_variant": model_config.paligemma_variant,
-        "action_expert_variant": model_config.action_expert_variant,
+        "source_action_dim": model_config.action_dim,
+        "source_action_horizon": model_config.action_horizon,
+        "target_action_dim": target_model_config.action_dim,
+        "target_action_horizon": target_model_config.action_horizon,
+        "paligemma_variant": target_model_config.paligemma_variant,
+        "action_expert_variant": target_model_config.action_expert_variant,
         "precision": precision,
+        "target_model_type": type(target_model_config).__name__,
     }
     with open(os.path.join(output_path, "config.json"), "w") as f:
         json.dump(config_dict, f, indent=2)
@@ -558,6 +649,7 @@ def convert_pi0_checkpoint(
 def main(
     checkpoint_dir: str,
     config_name: str,
+    target_config_name: str | None = None,
     output_path: str | None = None,
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
     *,
@@ -569,18 +661,21 @@ def main(
         checkpoint_dir: Path to the JAX checkpoint directory
         output_path: Path to save converted PyTorch model (required for conversion)
         precision: Precision for model conversion
+        target_config_name: Optional target model config to save. Use this to
+            materialize a PI0/PI05 checkpoint into an ACOT-shaped PyTorch checkpoint.
         inspect_only: Only inspect parameter keys, don't convert
     """
     model_config = _config.get_config(config_name).model
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
         raise ValueError(f"Config {config_name} is not a Pi0Config")
+    target_model_config = _config.get_config(target_config_name).model if target_config_name else None
     if inspect_only:
         load_jax_model_and_print_keys(checkpoint_dir)
     else:
         if not output_path:
             print("Error: --output_path is required for conversion. Use --inspect_only to only view keys.")
             return
-        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config)
+        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config, target_model_config)
 
 
 if __name__ == "__main__":
