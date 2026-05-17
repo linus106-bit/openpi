@@ -186,6 +186,21 @@ def _expand_pi0_weights_for_acot(state_dict):
     return expanded
 
 
+def _add_paligemma_language_model_aliases(state_dict):
+    """Materialize PaliGemma language-model aliases omitted by safetensors save_model."""
+    expanded = dict(state_dict)
+    model_prefix = "paligemma_with_expert.paligemma.model.language_model."
+    direct_prefix = "paligemma_with_expert.paligemma.language_model."
+    for key, value in list(state_dict.items()):
+        if key.startswith(model_prefix):
+            alias = f"{direct_prefix}{key.removeprefix(model_prefix)}"
+            expanded.setdefault(alias, value)
+        elif key.startswith(direct_prefix):
+            alias = f"{model_prefix}{key.removeprefix(direct_prefix)}"
+            expanded.setdefault(alias, value)
+    return expanded
+
+
 def _is_expected_missing_acot_key(key: str) -> bool:
     """Keys that should remain randomly initialized when bootstrapping ACOT from PI0/PI05."""
     if key.startswith("paligemma_with_expert.gemma_experts.1."):
@@ -220,6 +235,7 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
         if not is_acot_checkpoint:
             logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
             state_dict = _expand_pi0_weights_for_acot(state_dict)
+        state_dict = _add_paligemma_language_model_aliases(state_dict)
         missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
         expected_missing = [key for key in missing if _is_expected_missing_acot_key(key)]
         unexpected_missing = [key for key in missing if key not in expected_missing]
