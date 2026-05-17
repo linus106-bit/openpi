@@ -1,4 +1,3 @@
-import contextlib
 import logging
 import math
 from typing import Literal
@@ -419,19 +418,19 @@ class ACOTPytorch(PI0Pytorch):
         language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         prev_gradient_checkpointing = getattr(language_model, "gradient_checkpointing", False)
-        cache_without_grad = self.training and prev_gradient_checkpointing
-        cache_context = torch.no_grad() if cache_without_grad else contextlib.nullcontext()
         if prev_gradient_checkpointing:
+            # HuggingFace disables use_cache while gradient checkpointing is enabled.
+            # Temporarily disable it for this prefill only, but keep autograd enabled
+            # so the implicit reasoner path matches the JAX ACoT-VLA training graph.
             language_model.gradient_checkpointing = False
         try:
-            with cache_context:
-                _, past_key_values = self.paligemma_with_expert.forward(
-                    attention_mask=prefix_att_2d_masks_4d,
-                    position_ids=prefix_position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, None, None],
-                    use_cache=True,
-                )
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None, None],
+                use_cache=True,
+            )
         finally:
             if prev_gradient_checkpointing:
                 language_model.gradient_checkpointing = prev_gradient_checkpointing
