@@ -186,6 +186,22 @@ def _expand_pi0_weights_for_acot(state_dict):
     return expanded
 
 
+def _is_expected_missing_acot_key(key: str) -> bool:
+    """Keys that should remain randomly initialized when bootstrapping ACOT from PI0/PI05."""
+    if key.startswith("paligemma_with_expert.gemma_experts.1."):
+        return True
+    return key.startswith(
+        (
+            "explicit_action_reasoner.",
+            "implicit_action_reasoner.",
+            "implicit_action_reasoner_interact.",
+            "explicit_action_reason_proj.",
+            "implicit_action_reason_proj.",
+            "action_reasoning_fusion.",
+        )
+    )
+
+
 def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
     """Load an initial PyTorch checkpoint for fine-tuning.
 
@@ -205,16 +221,21 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
             logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
             state_dict = _expand_pi0_weights_for_acot(state_dict)
         missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+        expected_missing = [key for key in missing if _is_expected_missing_acot_key(key)]
+        unexpected_missing = [key for key in missing if key not in expected_missing]
         logging.info(
-            "Loaded PyTorch weights from %s with %d missing and %d unexpected keys",
+            "Loaded PyTorch weights from %s with %d expected missing, %d unexpected missing, and %d unexpected keys",
             pytorch_weight_path,
-            len(missing),
+            len(expected_missing),
+            len(unexpected_missing),
             len(unexpected),
         )
-        if missing:
-            logging.info("Missing keys after ACOT initialization: %s", list(missing)[:20])
+        if expected_missing:
+            logging.info("Expected randomly initialized ACOT-only keys: %s", expected_missing[:20])
+        if unexpected_missing:
+            logging.warning("Unexpected missing keys after ACOT initialization: %s", unexpected_missing[:20])
         if unexpected:
-            logging.info("Unexpected keys after ACOT initialization: %s", list(unexpected)[:20])
+            logging.warning("Unexpected keys after ACOT initialization: %s", list(unexpected)[:20])
         return
 
     safetensors.torch.load_model(model_to_load, model_path)
