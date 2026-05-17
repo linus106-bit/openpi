@@ -153,89 +153,8 @@ def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
-def _expand_pi0_weights_for_acot(state_dict):
-    """Map a converted PI0/PI05 PyTorch checkpoint onto the ACOT PyTorch model.
-
-    This mirrors ACoT-VLA's JAX ACOTCheckpointWeightLoader: keep all matching
-    PI0/PI05 weights, use the PI0 action expert for ACOT's coarse reasoner
-    expert, and copy action/time projections into their coarse projection names.
-    The final ACOT action expert is left at model initialization unless an ACOT
-    checkpoint already provides it.
-    """
-    expanded = dict(state_dict)
-    for key, value in list(state_dict.items()):
-        if key.startswith("paligemma_with_expert.gemma_expert."):
-            suffix = key.removeprefix("paligemma_with_expert.gemma_expert.")
-            expanded[f"paligemma_with_expert.gemma_experts.0.{suffix}"] = value
-        elif key.startswith("paligemma_with_expert.gemma_experts.0."):
-            suffix = key.removeprefix("paligemma_with_expert.gemma_experts.0.")
-            expanded[f"paligemma_with_expert.gemma_expert.{suffix}"] = value
-
-        projection_copies = {
-            "action_in_proj.": "coarse_action_in_proj.",
-            "action_out_proj.": "coarse_action_out_proj.",
-            "time_mlp_in.": "coarse_time_mlp_in.",
-            "time_mlp_out.": "coarse_time_mlp_out.",
-            "action_time_mlp_in.": "coarse_action_time_mlp_in.",
-            "action_time_mlp_out.": "coarse_action_time_mlp_out.",
-        }
-        for src_prefix, dst_prefix in projection_copies.items():
-            if key.startswith(src_prefix):
-                expanded[f"{dst_prefix}{key.removeprefix(src_prefix)}"] = value
-                break
-    return expanded
-
-
-def _add_paligemma_language_model_aliases(state_dict):
-    """Materialize PaliGemma aliases omitted by safetensors save_model."""
-    expanded = dict(state_dict)
-    model_prefix = "paligemma_with_expert.paligemma.model.language_model."
-    direct_prefix = "paligemma_with_expert.paligemma.language_model."
-    for key, value in list(state_dict.items()):
-        if key.startswith(model_prefix):
-            alias = f"{direct_prefix}{key.removeprefix(model_prefix)}"
-            expanded.setdefault(alias, value)
-        elif key.startswith(direct_prefix):
-            alias = f"{model_prefix}{key.removeprefix(direct_prefix)}"
-            expanded.setdefault(alias, value)
-
-    # PaliGemma ties input embeddings and lm_head. save_model keeps only one
-    # shared tensor, while raw load_state_dict expects both state_dict keys.
-    tied_keys = [
-        "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
-        "paligemma_with_expert.paligemma.language_model.embed_tokens.weight",
-        "paligemma_with_expert.paligemma.lm_head.weight",
-    ]
-    tied_value = next((expanded[key] for key in tied_keys if key in expanded), None)
-    if tied_value is not None:
-        for key in tied_keys:
-            expanded.setdefault(key, tied_value)
-    return expanded
-
-
-def _is_expected_missing_acot_key(key: str) -> bool:
-    """Keys that should remain randomly initialized when bootstrapping ACOT from PI0/PI05."""
-    if key.startswith("paligemma_with_expert.gemma_experts.1."):
-        return True
-    return key.startswith(
-        (
-            "explicit_action_reasoner.",
-            "implicit_action_reasoner.",
-            "implicit_action_reasoner_interact.",
-            "explicit_action_reason_proj.",
-            "implicit_action_reason_proj.",
-            "action_reasoning_fusion.",
-        )
-    )
-
-
 def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
-    """Load an initial PyTorch checkpoint for fine-tuning.
-
-    ACOT can be initialized from either an ACOT checkpoint or a converted PI0/PI05
-    checkpoint. The latter is expanded with the same mapping used by the original
-    JAX ACoT-VLA loader.
-    """
+    """Load an initial PyTorch checkpoint for fine-tuning."""
     model_to_load = unwrap_model(model)
     model_path = os.path.join(pytorch_weight_path, "model.safetensors")
     if isinstance(model_to_load, openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch):
@@ -245,39 +164,24 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
             key.startswith("coarse_action_in_proj.") or "paligemma_with_expert.gemma_experts.1." in key
             for key in checkpoint_keys
         )
-        if is_acot_checkpoint:
-            missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, device=str(device))
-            logging.info(
-                "Loaded ACOT PyTorch weights from %s with %d missing and %d unexpected keys",
-                pytorch_weight_path,
-                len(missing),
-                len(unexpected),
+        if not is_acot_checkpoint:
+            raise ValueError(
+                "ACOT PyTorch training expects an ACOT-shaped checkpoint. Convert the JAX pi05_base checkpoint with "
+                "`examples/convert_jax_model_to_pytorch.py --config_name "
+                "acot_libero_action_cot_explicit_implicit_co_fusion_torch --checkpoint_dir /path/to/pi05_base "
+                "--output_path /path/to/pi05_acot_base`, then pass that output path as --pytorch_weight_path."
             )
-            if missing:
-                logging.warning("Missing keys after ACOT load_model: %s", list(missing)[:20])
-            if unexpected:
-                logging.warning("Unexpected keys after ACOT load_model: %s", list(unexpected)[:20])
-            return
-        logging.info("Detected PI0/PI05 PyTorch checkpoint; expanding weights for ACOT initialization")
-        state_dict = safetensors.torch.load_file(model_path, device=str(device))
-        state_dict = _expand_pi0_weights_for_acot(state_dict)
-        state_dict = _add_paligemma_language_model_aliases(state_dict)
-        missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
-        expected_missing = [key for key in missing if _is_expected_missing_acot_key(key)]
-        unexpected_missing = [key for key in missing if key not in expected_missing]
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, device=str(device))
         logging.info(
-            "Loaded PyTorch weights from %s with %d expected missing, %d unexpected missing, and %d unexpected keys",
+            "Loaded ACOT PyTorch weights from %s with %d missing and %d unexpected keys",
             pytorch_weight_path,
-            len(expected_missing),
-            len(unexpected_missing),
+            len(missing),
             len(unexpected),
         )
-        if expected_missing:
-            logging.info("Expected randomly initialized ACOT-only keys: %s", expected_missing[:20])
-        if unexpected_missing:
-            logging.warning("Unexpected missing keys after ACOT initialization: %s", unexpected_missing[:20])
+        if missing:
+            logging.warning("Missing keys after ACOT load_model: %s", list(missing)[:20])
         if unexpected:
-            logging.warning("Unexpected keys after ACOT initialization: %s", list(unexpected)[:20])
+            logging.warning("Unexpected keys after ACOT load_model: %s", list(unexpected)[:20])
         return
 
     safetensors.torch.load_model(model_to_load, model_path)
