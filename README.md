@@ -271,8 +271,7 @@ For ACoT-VLA on LIBERO, convert the `pi05_base` checkpoint into an ACOT-shaped P
 
 ```bash
 uv run examples/convert_jax_model_to_pytorch.py \
-    --config_name pi05_aloha \
-    --target_config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
+    --config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
     --checkpoint_dir /path/to/pi05_base \
     --output_path /path/to/converted/acot_libero_pytorch
 

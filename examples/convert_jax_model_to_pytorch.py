@@ -27,8 +27,7 @@ Example:
 
     # pi05_base converted into an ACOT-shaped PyTorch checkpoint
     python examples/convert_jax_model_to_pytorch.py \
-        --config_name pi05_aloha \
-        --target_config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
+        --config_name acot_libero_action_cot_explicit_implicit_co_fusion_torch \
         --checkpoint_dir /path/to/pi05_base \
         --output_path /path/to/converted/acot_libero_pytorch
 """
@@ -649,10 +648,10 @@ def convert_pi0_checkpoint(
 def main(
     checkpoint_dir: str,
     config_name: str,
-    target_config_name: str | None = None,
     output_path: str | None = None,
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
     *,
+    target_config_name: str | None = None,
     inspect_only: bool = False,
 ):
     """Load JAX model and optionally convert to PyTorch.
@@ -661,14 +660,28 @@ def main(
         checkpoint_dir: Path to the JAX checkpoint directory
         output_path: Path to save converted PyTorch model (required for conversion)
         precision: Precision for model conversion
-        target_config_name: Optional target model config to save. Use this to
-            materialize a PI0/PI05 checkpoint into an ACOT-shaped PyTorch checkpoint.
+        target_config_name: Optional target model config for legacy PI0-to-target conversion.
+            Prefer passing the desired target config as config_name.
         inspect_only: Only inspect parameter keys, don't convert
     """
-    model_config = _config.get_config(config_name).model
-    if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
-        raise ValueError(f"Config {config_name} is not a Pi0Config")
+    config_model = _config.get_config(config_name).model
     target_model_config = _config.get_config(target_config_name).model if target_config_name else None
+    if isinstance(config_model, openpi.models.pi0_config.Pi0Config):
+        model_config = config_model
+    elif isinstance(config_model, openpi.models.acot_config.ACOTConfig):
+        if target_model_config is not None:
+            raise ValueError("Use either an ACOT config_name or target_config_name, not both.")
+        target_model_config = config_model
+        model_config = openpi.models.pi0_config.Pi0Config(
+            pi05=config_model.pi05,
+            discrete_state_input=config_model.discrete_state_input,
+            action_dim=config_model.action_dim,
+            paligemma_variant=config_model.paligemma_variant,
+            action_expert_variant=config_model.coarse_action_expert_variant,
+            pytorch_compile_mode=None,
+        )
+    else:
+        raise ValueError(f"Config {config_name} is not a Pi0Config or ACOTConfig")
     if inspect_only:
         load_jax_model_and_print_keys(checkpoint_dir)
     else:
