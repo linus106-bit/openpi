@@ -166,6 +166,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         models = self._stream_models()
         num_layers = self.paligemma.config.text_config.num_hidden_layers
         hidden_states_by_stream = list(inputs_embeds)
+        use_gradient_checkpointing = self.training and any(
+            getattr(models[stream_idx], "gradient_checkpointing", False) for stream_idx in active_indices
+        )
 
         def compute_layer_complete(layer_idx, hidden_states_by_stream, attention_mask, position_ids, adarms_cond):
             query_states = []
@@ -234,10 +237,44 @@ class PaliGemmaWithExpertModel(nn.Module):
                 start_pos = end_pos
             return next_hidden_states
 
-        for layer_idx in range(num_layers):
-            hidden_states_by_stream = compute_layer_complete(
-                layer_idx, hidden_states_by_stream, attention_mask, position_ids, adarms_cond
+        def checkpointed_layer(layer_idx, hidden_states_by_stream, attention_mask, position_ids, adarms_cond):
+            active_hidden_states = tuple(hidden_states_by_stream[stream_idx] for stream_idx in active_indices)
+            adarms_tensor_indices = [stream_idx for stream_idx in active_indices if adarms_cond[stream_idx] is not None]
+            active_adarms = tuple(adarms_cond[stream_idx] for stream_idx in adarms_tensor_indices)
+
+            def checkpoint_func(*tensor_args):
+                split = len(active_indices)
+                checkpoint_hidden_states = list(hidden_states_by_stream)
+                checkpoint_adarms = list(adarms_cond)
+                for idx, stream_idx in enumerate(active_indices):
+                    checkpoint_hidden_states[stream_idx] = tensor_args[idx]
+                for idx, stream_idx in enumerate(adarms_tensor_indices):
+                    checkpoint_adarms[stream_idx] = tensor_args[split + idx]
+                next_states = compute_layer_complete(
+                    layer_idx, checkpoint_hidden_states, attention_mask, position_ids, checkpoint_adarms
+                )
+                return tuple(next_states[stream_idx] for stream_idx in active_indices)
+
+            checkpoint_args = (*active_hidden_states, *active_adarms)
+            next_active_hidden_states = torch.utils.checkpoint.checkpoint(
+                checkpoint_func, *checkpoint_args, use_reentrant=False, preserve_rng_state=False
             )
+            if not isinstance(next_active_hidden_states, tuple):
+                next_active_hidden_states = (next_active_hidden_states,)
+            next_hidden_states = list(hidden_states_by_stream)
+            for stream_idx, hidden_state in zip(active_indices, next_active_hidden_states, strict=True):
+                next_hidden_states[stream_idx] = hidden_state
+            return next_hidden_states
+
+        for layer_idx in range(num_layers):
+            if use_gradient_checkpointing:
+                hidden_states_by_stream = checkpointed_layer(
+                    layer_idx, hidden_states_by_stream, attention_mask, position_ids, adarms_cond
+                )
+            else:
+                hidden_states_by_stream = compute_layer_complete(
+                    layer_idx, hidden_states_by_stream, attention_mask, position_ids, adarms_cond
+                )
 
         outputs = [None] * len(inputs_embeds)
         for stream_idx in active_indices:
