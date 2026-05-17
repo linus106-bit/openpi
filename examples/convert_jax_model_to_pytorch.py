@@ -651,7 +651,6 @@ def main(
     output_path: str | None = None,
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
     *,
-    target_config_name: str | None = None,
     inspect_only: bool = False,
 ):
     """Load JAX model and optionally convert to PyTorch.
@@ -660,17 +659,13 @@ def main(
         checkpoint_dir: Path to the JAX checkpoint directory
         output_path: Path to save converted PyTorch model (required for conversion)
         precision: Precision for model conversion
-        target_config_name: Optional target model config for legacy PI0-to-target conversion.
-            Prefer passing the desired target config as config_name.
         inspect_only: Only inspect parameter keys, don't convert
     """
     config_model = _config.get_config(config_name).model
-    target_model_config = _config.get_config(target_config_name).model if target_config_name else None
     if isinstance(config_model, openpi.models.pi0_config.Pi0Config):
         model_config = config_model
+        target_model_config = None
     elif isinstance(config_model, openpi.models.acot_config.ACOTConfig):
-        if target_model_config is not None:
-            raise ValueError("Use either an ACOT config_name or target_config_name, not both.")
         target_model_config = config_model
         model_config = openpi.models.pi0_config.Pi0Config(
             pi05=config_model.pi05,
