@@ -188,6 +188,55 @@ def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
     logging.info(f"Loaded PyTorch weights from {pytorch_weight_path}")
 
 
+def apply_pytorch_freezing(model, config: _config.TrainConfig):
+    """Apply PyTorch-specific parameter freezing.
+
+    The JAX trainer uses nnx filter objects for freezing. Those filters do not
+    apply to torch modules, so we mirror the supported cases with name-based
+    torch parameter matching here.
+    """
+    freeze_llm = getattr(config, "pytorch_freeze_llm", False)
+    freeze_llm_embedder = getattr(config, "pytorch_freeze_llm_embedder", True)
+    if not freeze_llm:
+        return
+
+    model_to_freeze = unwrap_model(model)
+    frozen_params = 0
+    total_params = 0
+    frozen_names = []
+
+    def should_freeze_llm_param(name: str) -> bool:
+        is_paligemma_llm = (
+            "paligemma_with_expert.paligemma.model.language_model" in name
+            or "paligemma_with_expert.paligemma.language_model" in name
+            or "paligemma_with_expert.paligemma.lm_head" in name
+        )
+        if not is_paligemma_llm:
+            return False
+        if freeze_llm_embedder:
+            return True
+        return "embed_tokens" not in name and "lm_head" not in name
+
+    for name, param in model_to_freeze.named_parameters():
+        total_params += param.numel()
+        if should_freeze_llm_param(name):
+            param.requires_grad_(False)
+            frozen_params += param.numel()
+            if len(frozen_names) < 20:
+                frozen_names.append(name)
+
+    if frozen_params == 0:
+        logging.warning("pytorch_freeze_llm=True but no PaliGemma LLM parameters matched.")
+    else:
+        logging.info(
+            "Applied PyTorch LLM freeze: frozen %.2fM / %.2fM params (freeze_embedder=%s)",
+            frozen_params / 1e6,
+            total_params / 1e6,
+            freeze_llm_embedder,
+        )
+        logging.info("First frozen parameter names: %s", frozen_names)
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -282,7 +331,14 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         else:
             raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
 
-        optimizer.load_state_dict(optimizer_state_dict)
+        try:
+            optimizer.load_state_dict(optimizer_state_dict)
+        except ValueError as exc:
+            logging.warning(
+                "Skipping optimizer state from %s because it is incompatible with the current trainable parameter set: %s",
+                optimizer_path,
+                exc,
+            )
         del optimizer_state_dict
         torch.cuda.empty_cache()
         gc.collect()
@@ -473,6 +529,9 @@ def train_loop(config: _config.TrainConfig):
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
 
+    # Apply torch parameter freezing before DDP wraps the module.
+    apply_pytorch_freezing(model, config)
+
     # Enable memory optimizations for large-scale training
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
@@ -503,8 +562,12 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    trainable_params = [p for p in get_model_parameters(model) if p.requires_grad]
+    if not trainable_params:
+        raise ValueError("No trainable PyTorch parameters remain after applying freeze settings.")
+
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

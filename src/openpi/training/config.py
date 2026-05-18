@@ -522,6 +522,10 @@ class TrainConfig:
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
+    # PyTorch-only freezing controls. The JAX freeze_filter below is an nnx filter and
+    # cannot be applied directly to torch modules.
+    pytorch_freeze_llm: bool = False
+    pytorch_freeze_llm_embedder: bool = True
 
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
@@ -834,6 +838,8 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
+        pytorch_freeze_llm=True,
+        pytorch_freeze_llm_embedder=True,
         weight_loader=weight_loaders.NoOpWeightLoader(),
         pytorch_weight_path="/path/to/converted/acot_libero_pytorch",
         num_train_steps=51_000,
