@@ -45,7 +45,12 @@ class DroidInputs(transforms.DataTransformFn):
         wrist_image = _parse_image(data["observation/wrist_image_left"])
 
         match self.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI05:
+            case (
+                _model.ModelType.PI0
+                | _model.ModelType.PI05
+                | _model.ModelType.ACOT_VLA_PI0
+                | _model.ModelType.ACOT_VLA_PI05
+            ):
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (base_image, wrist_image, np.zeros_like(base_image))
                 image_masks = (np.True_, np.True_, np.False_)
@@ -78,4 +83,4 @@ class DroidInputs(transforms.DataTransformFn):
 class DroidOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         # Only return the first 8 dims.
-        return {"actions": np.asarray(data["actions"][:, :8])}
+        return {key: np.asarray(data[key][:, :8]) for key in ("actions", "coarse_actions") if key in data}

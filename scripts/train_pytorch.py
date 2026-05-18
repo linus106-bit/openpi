@@ -40,7 +40,9 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+import openpi.models.acot_config
 import openpi.models.pi0_config
+import openpi.models_pytorch.acot_vla_pytorch
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -144,6 +146,46 @@ def get_model_parameters(model):
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
         else model.parameters()
     )
+
+
+def unwrap_model(model):
+    """Return the underlying model when DDP is enabled."""
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
+    """Load an initial PyTorch checkpoint for fine-tuning."""
+    model_to_load = unwrap_model(model)
+    model_path = os.path.join(pytorch_weight_path, "model.safetensors")
+    if isinstance(model_to_load, openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch):
+        with safetensors.safe_open(model_path, framework="pt", device=str(device)) as checkpoint_file:
+            checkpoint_keys = list(checkpoint_file.keys())
+        is_acot_checkpoint = any(
+            key.startswith("coarse_action_in_proj.") or "paligemma_with_expert.gemma_experts.1." in key
+            for key in checkpoint_keys
+        )
+        if not is_acot_checkpoint:
+            raise ValueError(
+                "ACOT PyTorch training expects an ACOT-shaped checkpoint. Convert the JAX pi05_base checkpoint with "
+                "`examples/convert_jax_model_to_pytorch.py --config_name "
+                "acot_libero_action_cot_explicit_implicit_co_fusion_torch --checkpoint_dir /path/to/pi05_base "
+                "--output_path /path/to/pi05_acot_base`, then pass that output path as --pytorch_weight_path."
+            )
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, device=str(device))
+        logging.info(
+            "Loaded ACOT PyTorch weights from %s with %d missing and %d unexpected keys",
+            pytorch_weight_path,
+            len(missing),
+            len(unexpected),
+        )
+        if missing:
+            logging.warning("Missing keys after ACOT load_model: %s", list(missing)[:20])
+        if unexpected:
+            logging.warning("Unexpected keys after ACOT load_model: %s", list(unexpected)[:20])
+        return
+
+    safetensors.torch.load_model(model_to_load, model_path)
+    logging.info(f"Loaded PyTorch weights from {pytorch_weight_path}")
 
 
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
@@ -307,6 +349,7 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -350,9 +393,16 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
+    if config.batch_size % world_size != 0:
+        raise ValueError(
+            f"Batch size {config.batch_size} must be divisible by the number of PyTorch workers {world_size}."
+        )
     effective_batch_size = config.batch_size // world_size
+    effective_global_batch_size = config.batch_size * config.gradient_accumulation_steps
     logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        f"Using micro-batch size per GPU: {effective_batch_size} "
+        f"(global micro-batch: {config.batch_size}, accumulation: {config.gradient_accumulation_steps}, "
+        f"effective global batch: {effective_global_batch_size})"
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
@@ -364,7 +414,7 @@ def train_loop(config: _config.TrainConfig):
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        observation, actions = sample_batch[:2]
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -390,7 +440,10 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    if isinstance(config.model, openpi.models.acot_config.ACOTConfig):
+        model_cfg = dataclasses.replace(config.model, dtype=config.pytorch_training_precision)
+        model = openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch(model_cfg).to(device)
+    elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -401,12 +454,12 @@ def train_loop(config: _config.TrainConfig):
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
         )
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
     else:
         model_cfg = config.model
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -441,12 +494,7 @@ def train_loop(config: _config.TrainConfig):
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        load_initial_pytorch_weights(model, config.pytorch_weight_path, device)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -461,6 +509,7 @@ def train_loop(config: _config.TrainConfig):
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        foreach=False,
     )
 
     # Load checkpoint if resuming
@@ -487,7 +536,9 @@ def train_loop(config: _config.TrainConfig):
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
         )
         logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
+            f"Training config: batch_size={config.batch_size}, "
+            f"gradient_accumulation_steps={config.gradient_accumulation_steps}, "
+            f"effective_global_batch_size={effective_global_batch_size}, num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
@@ -506,34 +557,48 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    micro_step = 0
+    accumulated_loss = 0.0
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for batch in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
+            observation, actions = batch[:2]
+            coarse_actions = batch[2] if len(batch) == 3 else None
+
+            # The unified data loader returns (observation, actions), or
+            # (observation, actions, coarse_actions) for ACOT.
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
+            if coarse_actions is not None:
+                coarse_actions = coarse_actions.to(torch.float32).to(device)
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
+            should_step = (micro_step + 1) % config.gradient_accumulation_steps == 0
+            # Keep DDP gradient hooks active for every micro-batch. This costs more communication
+            # than no_sync(), but avoids reducer state issues with activation checkpointing.
+            losses = (
+                model(observation, actions, coarse_actions) if coarse_actions is not None else model(observation, actions)
+            )
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+            raw_loss = losses.mean()
+            loss = raw_loss / config.gradient_accumulation_steps
+            accumulated_loss += raw_loss.detach().item()
 
             # Backward pass
             loss.backward()
@@ -541,6 +606,10 @@ def train_loop(config: _config.TrainConfig):
             # Log memory usage after backward pass
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
+
+            micro_step += 1
+            if not should_step:
+                continue
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
@@ -559,7 +628,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": accumulated_loss / config.gradient_accumulation_steps,
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -608,8 +677,13 @@ def train_loop(config: _config.TrainConfig):
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "loss": f"{accumulated_loss / config.gradient_accumulation_steps:.4f}",
+                        "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                        "step": global_step,
+                    }
                 )
+            accumulated_loss = 0.0
 
     # Close progress bar
     if pbar is not None:

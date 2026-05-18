@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.acot_config as acot_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -134,6 +135,43 @@ class ModelTransformFactory(GroupFactory):
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.ACOT_VLA_PI0:
+                assert isinstance(model_config, acot_config.ACOTConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                        ),
+                        _transforms.GenerateACOTActions(
+                            model_config.coarse_action_horizon,
+                            model_config.action_horizon,
+                            model_config.coarse_action_stride,
+                            model_config.action_stride,
+                        ),
+                        _transforms.ACOTPadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.ACOT_VLA_PI05:
+                assert isinstance(model_config, acot_config.ACOTConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.GenerateACOTActions(
+                            model_config.coarse_action_horizon,
+                            model_config.action_horizon,
+                            model_config.coarse_action_stride,
+                            model_config.action_stride,
+                        ),
+                        _transforms.ACOTPadStatesAndActions(model_config.action_dim),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -502,8 +540,12 @@ class TrainConfig:
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
-    # Global batch size.
+    # Global batch size for each forward/backward pass.
     batch_size: int = 32
+    # Number of micro-batches to accumulate before each optimizer step.
+    # The effective global batch size for PyTorch training is
+    # batch_size * gradient_accumulation_steps.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -554,6 +596,8 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_steps must be >= 1.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -761,6 +805,40 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="acot_libero_action_cot_explicit_implicit_co_fusion_torch",
+        model=acot_config.ACOTConfig(
+            coarse_action_horizon=15,
+            action_horizon=10,
+            pi05=True,
+            discrete_state_input=False,
+            coarse_action_expert_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            coarse_action_stride=2,
+            action_stride=1,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        pytorch_weight_path="/path/to/converted/acot_libero_pytorch",
+        num_train_steps=51_000,
+        save_interval=10_000,
+    ),
     #
     # Fine-tuning Aloha configs.
     #
@@ -964,6 +1042,46 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_acot",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=acot_config.ACOTConfig(
+            paligemma_variant="dummy",
+            coarse_action_expert_variant="dummy",
+            action_expert_variant="dummy",
+            coarse_action_horizon=6,
+            action_horizon=4,
+            pi05=True,
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            pytorch_compile_mode=None,
+        ),
+        save_interval=100,
+        overwrite=True,
+        exp_name="debug_acot",
+        num_train_steps=2,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="acot_icra_simulation_challenge_reasoning_to_action_torch",
+        model=acot_config.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            pi05=True,
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=20_000,
     ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),

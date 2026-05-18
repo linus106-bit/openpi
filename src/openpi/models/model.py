@@ -33,6 +33,8 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    ACOT_VLA_PI0 = "acot_pi0"
+    ACOT_VLA_PI05 = "acot_pi05"
 
 
 # The model always expects these images
@@ -139,6 +141,7 @@ class Observation(Generic[ArrayT]):
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
+CoarseActions = at.Float[ArrayT, "*b cah ad"]
 
 
 def preprocess_observation(
@@ -242,7 +245,12 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        if train_config.model.model_type in (ModelType.ACOT_VLA_PI0, ModelType.ACOT_VLA_PI05):
+            from openpi.models_pytorch import acot_vla_pytorch
+
+            model = acot_vla_pytorch.ACOTPytorch(config=train_config.model)
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
         return model
 
