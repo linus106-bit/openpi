@@ -51,6 +51,10 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Disable torch.compile for PyTorch policy inference.
+    # Useful for repeated eval runs where Triton autotune dominates.
+    disable_pytorch_compile: bool = False
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -76,11 +80,26 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def _maybe_disable_pytorch_compile(config: _config.TrainConfig, *, disable: bool) -> _config.TrainConfig:
+    """Return a serving-only config with PyTorch sample_actions compile disabled."""
+    if not disable or not hasattr(config.model, "pytorch_compile_mode"):
+        return config
+    return dataclasses.replace(config, model=dataclasses.replace(config.model, pytorch_compile_mode=None))
+
+
+def create_default_policy(
+    env: EnvMode,
+    *,
+    default_prompt: str | None = None,
+    disable_pytorch_compile: bool = False,
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
+        config = _maybe_disable_pytorch_compile(
+            _config.get_config(checkpoint.config), disable=disable_pytorch_compile
+        )
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            config, checkpoint.dir, default_prompt=default_prompt
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -89,11 +108,18 @@ def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
     match args.policy:
         case Checkpoint():
+            config = _maybe_disable_pytorch_compile(
+                _config.get_config(args.policy.config), disable=args.disable_pytorch_compile
+            )
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                config, args.policy.dir, default_prompt=args.default_prompt
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(
+                args.env,
+                default_prompt=args.default_prompt,
+                disable_pytorch_compile=args.disable_pytorch_compile,
+            )
 
 
 def main(args: Args) -> None:
