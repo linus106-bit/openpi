@@ -37,6 +37,8 @@ import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.nn.parallel
+from torch.optim.swa_utils import AveragedModel
+from torch.optim.swa_utils import get_ema_multi_avg_fn
 import tqdm
 import wandb
 
@@ -153,6 +155,35 @@ def unwrap_model(model):
     return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
 
 
+def ema_module(ema_model: AveragedModel) -> torch.nn.Module:
+    """Return the plain wrapped module, never the AveragedModel checkpoint wrapper."""
+    return ema_model.module
+
+
+def set_ema_n_averaged(ema_model: AveragedModel, value: int):
+    ema_model.n_averaged.fill_(value)
+
+
+def reset_ema_model(ema_model: AveragedModel, model):
+    ema_module(ema_model).load_state_dict(unwrap_model(model).state_dict())
+    set_ema_n_averaged(ema_model, 1)
+
+
+def create_ema_model(model, decay: float | None, device: torch.device) -> AveragedModel | None:
+    if decay is None:
+        return None
+    ema_model = AveragedModel(
+        unwrap_model(model),
+        device=device,
+        multi_avg_fn=get_ema_multi_avg_fn(decay),
+        use_buffers=False,
+    )
+    # JAX initializes EMA from the current params, then blends on the first post-step update.
+    # AveragedModel copies on update when n_averaged == 0, so mark the initial copy as one average.
+    set_ema_n_averaged(ema_model, 1)
+    return ema_model
+
+
 def load_initial_pytorch_weights(model, pytorch_weight_path: str, device):
     """Load an initial PyTorch checkpoint for fine-tuning."""
     model_to_load = unwrap_model(model)
@@ -237,7 +268,15 @@ def apply_pytorch_freezing(model, config: _config.TrainConfig):
         logging.info("First frozen parameter names: %s", frozen_names)
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(
+    model,
+    optimizer,
+    global_step,
+    config,
+    is_main,
+    data_config,
+    ema_model: AveragedModel | None = None,
+):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -253,9 +292,15 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             shutil.rmtree(tmp_ckpt_dir)
         tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        # Save model state using safetensors (handle shared tensors). When EMA is enabled,
+        # model.safetensors remains the inference artifact and training_model.safetensors
+        # stores raw weights for resume, matching the JAX train-state / params split.
+        model_to_save = unwrap_model(model)
+        if ema_model is None:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        else:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "training_model.safetensors")
+            safetensors.torch.save_model(ema_module(ema_model), tmp_ckpt_dir / "model.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -265,6 +310,10 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             "global_step": global_step,
             "config": dataclasses.asdict(config),
             "timestamp": time.time(),
+            "ema_enabled": ema_model is not None,
+            "ema_decay": config.ema_decay if ema_model is not None else None,
+            "ema_n_averaged": int(ema_model.n_averaged.item()) if ema_model is not None else None,
+            "has_training_model": ema_model is not None,
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
@@ -285,7 +334,14 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+def load_checkpoint(
+    model,
+    optimizer,
+    checkpoint_dir,
+    device,
+    ema_model: AveragedModel | None = None,
+    config_ema_decay: float | None = None,
+):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -306,16 +362,52 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         log_memory_usage(device, latest_step, "before_loading_checkpoint")
 
     try:
+        # Load metadata before model state so checkpoint EMA semantics can guide resume behavior.
+        logging.info("Loading metadata...")
+        metadata_path = ckpt_dir / "metadata.pt"
+        metadata = torch.load(metadata_path, map_location=device, weights_only=False) if metadata_path.exists() else {}
+        global_step = metadata.get("global_step", latest_step)
+
         # Load model state with error handling
         logging.info("Loading model state...")
         safetensors_path = ckpt_dir / "model.safetensors"
+        training_safetensors_path = ckpt_dir / "training_model.safetensors"
+        checkpoint_has_ema_metadata = metadata.get("ema_enabled") is True
 
-        if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
-            logging.info("Loaded model state from safetensors format")
+        if training_safetensors_path.exists():
+            model_path_to_load = training_safetensors_path
+        elif checkpoint_has_ema_metadata:
+            raise FileNotFoundError(
+                f"EMA checkpoint metadata found at {ckpt_dir}, but raw training weights are missing: "
+                f"{training_safetensors_path}"
+            )
+        elif safetensors_path.exists():
+            model_path_to_load = safetensors_path
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+        safetensors.torch.load_model(unwrap_model(model), model_path_to_load, device=str(device))
+        logging.info("Loaded model state from %s", model_path_to_load.name)
+
+        if ema_model is not None:
+            checkpoint_ema_decay = metadata.get("ema_decay")
+            decay_matches = checkpoint_ema_decay is None or checkpoint_ema_decay == config_ema_decay
+            if checkpoint_has_ema_metadata and decay_matches:
+                safetensors.torch.load_model(ema_module(ema_model), safetensors_path, device=str(device))
+                set_ema_n_averaged(ema_model, int(metadata.get("ema_n_averaged") or 1))
+                logging.info("Loaded EMA state from %s", safetensors_path.name)
+            else:
+                if checkpoint_has_ema_metadata:
+                    logging.warning(
+                        "Resetting EMA from raw model because checkpoint ema_decay=%s but config ema_decay=%s",
+                        checkpoint_ema_decay,
+                        config_ema_decay,
+                    )
+                else:
+                    logging.info("Checkpoint has no EMA state; initializing EMA from raw model state")
+                reset_ema_model(ema_model, model)
+        elif checkpoint_has_ema_metadata:
+            logging.info("Checkpoint contains EMA state, but current config has ema_decay=None; continuing without EMA")
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -344,10 +436,6 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
 
-        # Load metadata
-        logging.info("Loading metadata...")
-        metadata = torch.load(ckpt_dir / "metadata.pt", map_location=device, weights_only=False)
-        global_step = metadata.get("global_step", latest_step)
         del metadata
         torch.cuda.empty_cache()
         gc.collect()
@@ -555,6 +643,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
         load_initial_pytorch_weights(model, config.pytorch_weight_path, device)
 
+    ema_model = create_ema_model(model, config.ema_decay, device)
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -578,7 +668,14 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(
+            model,
+            optim,
+            config.checkpoint_dir,
+            device,
+            ema_model=ema_model,
+            config_ema_decay=config.ema_decay,
+        )
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -610,7 +707,10 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        if ema_model is None:
+            logging.info("EMA is disabled for PyTorch training")
+        else:
+            logging.info("EMA is enabled for PyTorch training: decay=%s", config.ema_decay)
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -679,6 +779,8 @@ def train_loop(config: _config.TrainConfig):
 
             # Optimizer step
             optim.step()
+            if ema_model is not None:
+                ema_model.update_parameters(unwrap_model(model))
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
@@ -734,7 +836,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema_model=ema_model)
 
             # Update progress bar
             if pbar is not None:
