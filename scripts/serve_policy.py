@@ -1,8 +1,13 @@
 import dataclasses
 import enum
 import logging
+import os
+import random
 import socket
 
+import jax
+import numpy as np
+import torch
 import tyro
 
 from openpi.policies import policy as _policy
@@ -50,6 +55,8 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
+    # Seed used by the serving process for Python, NumPy, PyTorch, and JAX policy RNGs.
+    seed: int = 42
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -76,11 +83,27 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def _set_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    logging.info("Set serving random seed to %d", seed)
+
+
+def create_default_policy(env: EnvMode, *, default_prompt: str | None = None, seed: int = 42) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _config.get_config(checkpoint.config),
+            checkpoint.dir,
+            default_prompt=default_prompt,
+            rng=jax.random.key(seed),
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -90,13 +113,17 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                rng=jax.random.key(args.seed),
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(args.env, default_prompt=args.default_prompt, seed=args.seed)
 
 
 def main(args: Args) -> None:
+    _set_seed(args.seed)
     policy = create_policy(args)
     policy_metadata = policy.metadata
 
