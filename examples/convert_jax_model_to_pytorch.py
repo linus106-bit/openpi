@@ -50,6 +50,7 @@ import openpi.models.acot_config
 import openpi.models.gemma
 import openpi.models.model
 import openpi.models.pi0_config
+import openpi.models_pytorch.acot_checkpoint
 import openpi.models_pytorch.acot_vla_pytorch
 import openpi.models_pytorch.pi0_pytorch
 from openpi.training import utils
@@ -454,22 +455,6 @@ def _add_paligemma_tied_embedding_aliases(state_dict):
     return expanded
 
 
-def _is_expected_missing_acot_key(key: str) -> bool:
-    """Keys initialized by the target ACOT model when bootstrapping from PI0/PI05."""
-    if key.startswith("paligemma_with_expert.gemma_experts.1."):
-        return True
-    return key.startswith(
-        (
-            "explicit_action_reasoner.",
-            "implicit_action_reasoner.",
-            "implicit_action_reasoner_interact.",
-            "explicit_action_reason_proj.",
-            "implicit_action_reason_proj.",
-            "action_reasoning_fusion.",
-        )
-    )
-
-
 def load_jax_model_and_print_keys(checkpoint_dir: str):
     """
     Load JAX model from checkpoint and print all parameter keys.
@@ -596,8 +581,30 @@ def convert_pi0_checkpoint(
         target_model_config = dataclasses.replace(target_model_config, pytorch_compile_mode=None)
         pytorch_model = openpi.models_pytorch.acot_vla_pytorch.ACOTPytorch(target_model_config)
         acot_params = _add_paligemma_tied_embedding_aliases(_expand_pi0_weights_for_acot(all_params))
+        acot_clone_result = openpi.models_pytorch.acot_checkpoint.clone_acot_final_expert_from_coarse(
+            acot_params,
+            pytorch_model.state_dict(),
+        )
+        acot_params = acot_clone_result.state_dict
+        if acot_clone_result.cloned_destination_keys:
+            print(
+                "[INFO] Cloned ACOT final expert weights from coarse expert for "
+                f"{len(acot_clone_result.cloned_destination_keys)} tensors"
+            )
+        if acot_clone_result.skipped_destination_keys:
+            print(
+                "[WARN] Could not clone ACOT final expert weights for "
+                f"{len(acot_clone_result.skipped_destination_keys)} tensors"
+            )
         missing, unexpected = pytorch_model.load_state_dict(acot_params, strict=False)
-        unexpected_missing = [key for key in missing if not _is_expected_missing_acot_key(key)]
+        unexpected_missing = [
+            key
+            for key in missing
+            if not openpi.models_pytorch.acot_checkpoint.is_expected_missing_acot_key(
+                key,
+                skipped_final_expert_keys=acot_clone_result.skipped_destination_keys,
+            )
+        ]
         if unexpected_missing:
             print(f"Warning: unexpected missing ACOT keys during conversion: {unexpected_missing[:20]}")
         if unexpected:
